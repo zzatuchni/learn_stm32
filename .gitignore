@@ -1,3 +1,7 @@
 firmware.bin
 firmware.elf
 firmware.elf.map
+main.bin
+main.elf
+main.elf.map
+main.o

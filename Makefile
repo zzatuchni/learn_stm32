@@ -11,16 +11,16 @@ else
   RM = rm -f
 endif
 
-build: firmware.bin
+build: main.bin
 
-firmware.elf: $(SOURCES)
+main.elf: $(SOURCES)
 	arm-none-eabi-gcc $(SOURCES) $(CFLAGS) $(LDFLAGS) -o $@
 
-firmware.bin: firmware.elf
+main.bin: main.elf
 	arm-none-eabi-objcopy -O binary $< $@
 
-flash: firmware.bin
+flash: main.bin
 	st-flash --reset write $< 0x8000000
 
 clean:
-	$(RM) firmware.*
+	$(RM) main.*
