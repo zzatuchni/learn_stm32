@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 
 ////////////////////////////////////////////////////////////
 //  Misc
@@ -116,7 +117,6 @@ void _on_systick_interrupt(void) {
 //  UART
 ////////////////////////////////////////////////////////////
 
-
 #define UART2_START_ADDRESS 0x40004400
 
 #define UART2_PIN_BANK 'A'
@@ -144,14 +144,21 @@ static inline void uart_init() {
 
     UART2->CR1 = 0;                           // Disable this UART
     UART2->BRR = FREQ / UART2_BAUD_RATE;      // FREQ is a UART bus frequency
-    UART2->CR1 |= BIT(13) | BIT(2) | BIT(3);  // Set UE, RE, TE
+    UART2->CR1 |= BIT(13) | BIT(2) | BIT(3) | BIT(5);  // Set UE, RE, TE, RXNEIE
+
+    //enable the interrupt
+    #define NVIC_ISER1 0xE000E104
+    #define UART2_INTERRUPT_NUM 38
+    uint32_t *nvic_iser1 = (uint32_t *)NVIC_ISER1;
+    (*nvic_iser1) |= (1UL << (UART2_INTERRUPT_NUM % 32));
+
 }
 
 static inline uint8_t uart_read_byte() {
     return (uint8_t) (UART2->DR & 255);
 }
 
-static inline int uart_read_buf() {
+static inline int uart_read_ready() {
     return (UART2->SR & BIT(5));
 }
 
@@ -165,8 +172,33 @@ static inline void uart_write_buf(char *buf, size_t len) {
 }
 
 ////////////////////////////////////////////////////////////
+//  Command processing
+////////////////////////////////////////////////////////////
+
+#define COMMAND_MAX_LENGTH 64
+__attribute__((used)) static volatile uint8_t command_buffer[COMMAND_MAX_LENGTH];
+__attribute__((used)) static volatile uint8_t current_command_length = 0;
+__attribute__((used)) static volatile bool command_finished = false;
+
+void _on_uart2_interrupt(void) {
+    uint8_t byte = uart_read_byte();
+    if (current_command_length < COMMAND_MAX_LENGTH) {
+        command_buffer[current_command_length] = byte;
+        current_command_length++;
+        uart_write_byte(byte);
+    }
+    if (byte == '\r') {
+        command_finished = true;
+    }
+}
+
+////////////////////////////////////////////////////////////
 //  Main code
 ////////////////////////////////////////////////////////////
+
+void handle_command(char *command, uint8_t length) {
+    uart_write_buf(command, length);
+}
 
 int main(void) {
 
@@ -181,23 +213,17 @@ int main(void) {
     uart_init();
 
     // START LOOP
-
-    bool on = true;
-    gpio_write(true, led_pin);
+    uart_write_buf(">> ", 3);
     for (;;) {
-        if (on && (num_ticks % 1000) > 500) {
-            on = !on;
-            gpio_write(on, led_pin);
-            uart_write_buf("hi\r\n", 4);
+        if (command_finished) {
+            uart_write_buf("\r\n", 2);
+            handle_command((char *)command_buffer, (uint8_t)current_command_length);
+            uart_write_buf("\r\n>> ", 5);
+            current_command_length = 0;
+            command_finished = false;
         }
-        else if (!on && (num_ticks % 1000) < 500) {
-            on = !on;
-            gpio_write(on, led_pin);
-            uart_write_buf("hi\r\n", 4);
-        }
-
     }
-
+    
     return 0;
 }
 
@@ -219,5 +245,12 @@ __attribute__((naked, noreturn)) void _reset(void) {
 extern void _estack(void);  // Defined in link.ld
 
 // 16 standard and 91 STM32-specific handlers
-__attribute__((section(".vectors"))) void (*const volatile tab[16 + 91])(void) = {
-    _estack, _reset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _on_systick_interrupt};
+__attribute__((section(".vectors"))) void (*const volatile tab[16 + 99])(void) = {
+    _estack, _reset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _on_systick_interrupt,  //ARM core interrupts
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+    0, 0, 0, 0, 0, 0, _on_uart2_interrupt, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 32 - 47
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 48 - 63
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 64 - 79
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 80 - 96
+    };
