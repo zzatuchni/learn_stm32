@@ -22,28 +22,42 @@ typedef struct {
 
 } TaskData;
 
-__attribute__((used)) static volatile bool      scheduler_enabled = false;
+__attribute__((used)) static volatile bool      scheduler_enabled   = false;
+__attribute__((used)) static volatile uint64_t  tick_count          = 0;
+__attribute__((used)) static volatile uint8_t   round_robin_helper  = 0;
 
 __attribute__((used)) static volatile TaskData  task_list[MAX_NUM_TASKS];
 #define GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(x) (((x) - (&task_list[0]))/(sizeof(TaskData)))
 __attribute__((used)) static volatile TaskData  *task_list_head                 = NULL;
 __attribute__((used)) static volatile TaskData  *current_running_task           = NULL;
 
-__attribute__((used)) static volatile uint8_t   next_place_to_write_task_data   = 0;
+__attribute__((used)) static volatile uint8_t   task_list_write_pos             = 0;
 __attribute__((used)) static volatile uint8_t   current_num_tasks               = 0;
 __attribute__((used)) static volatile uint8_t   num_tasks_allocated             = 0;
 
-__attribute__((used)) static volatile TaskData  *ready_task_queue[MAX_NUM_TASKS];
-__attribute__((used)) static volatile uint8_t   ready_task_queue_size           = 0;
-__attribute__((used)) static volatile uint8_t   round_robin_helper              = 0;
+__attribute__((used)) static volatile TaskData  *ready_task_list[MAX_NUM_TASKS];
+__attribute__((used)) static volatile uint8_t   num_ready_tasks                 = 0;
 
 __attribute__((used)) static volatile uint8_t   task_stack_space[MAX_NUM_TASKS][TASK_STACK_SIZE];
+
+// NOTE: handle time_of_service overflow eventually
+typedef struct {
+    const    TaskData   *task;
+    volatile uint64_t   time_of_service;
+    volatile TaskTimer  *nextTaskTimerPtr;
+
+} TaskTimer;
+
+__attribute__((used)) static volatile TaskTimer task_timer_queue[MAX_NUM_TASKS];
+__attribute__((used)) static volatile TaskTimer *task_timer_queue_head          = NULL;
+__attribute__((used)) static volatile uint8_t   task_timer_queue_write_pos      = 0;
+__attribute__((used)) static volatile uint8_t   num_task_timers                 = 0;
 
 static void idle_task(void) {
     for (;;) {}
 }
 
-static inline void load_ready_task_queue() {
+static inline void load_ready_task_list() {
     TaskData *t1 = task_list_head;
 
     // get the first ready task
@@ -53,21 +67,22 @@ static inline void load_ready_task_queue() {
     if (t1) {
         // load ready tasks with the same priority onto the queue
         TaskData *t2 = t1;
-        uint8_t num_ready_tasks = 0;
+        uint8_t nrt = 0; // num ready tasks
         while (t2 && t2->priority == t1->priority) {
             if (t2->state == TASK_READY) {
-                ready_task_queue[num_ready_tasks] == t2;
-                num_ready_tasks++;
+                ready_task_list[num_ready_tasks] = t2;
+                nrt++;
             }
             t2 = t2->nextTaskDataPtr;
         }
-        ready_task_queue_size = num_ready_tasks;
+        num_ready_tasks = nrt;
 
     }
     else {
-        ready_task_queue_size = 0;
+        num_ready_tasks = 0;
     }
 }
+
 
 static inline void add_task(const void *funcPtr, uint8_t priority) {
     // task list is full
@@ -76,16 +91,16 @@ static inline void add_task(const void *funcPtr, uint8_t priority) {
     __asm__("cpsid if");
 
     // write the task data into the list
-    TaskData *new_task = &task_list[next_place_to_write_task_data];
+    TaskData *new_task = &task_list[task_list_write_pos];
 
     *new_task = (TaskData) { 
-        funcPtr, &task_stack_space[next_place_to_write_task_data][TASK_STACK_SIZE-16], 
+        funcPtr, &task_stack_space[task_list_write_pos][TASK_STACK_SIZE-16], 
         TASK_READY, priority, NULL, 0xFF 
     };
 
     // copy the function pointer into the new task's stack space so that
     // it's retreived while context switching (funcPtr becomes PC)
-    task_stack_space[next_place_to_write_task_data][TASK_STACK_SIZE-2] = funcPtr;
+    task_stack_space[task_list_write_pos][TASK_STACK_SIZE-2] = funcPtr;
 
     // new_task is not the only task in the list
     if (current_num_tasks > 0) {
@@ -118,28 +133,24 @@ static inline void add_task(const void *funcPtr, uint8_t priority) {
 
     // new_task is not filling in a gap left by a deleted task, 
     // i.e. it was newly allocated at the end of the task list memory-wise
-    if (next_place_to_write_task_data == num_tasks_allocated) {
+    if (task_list_write_pos == num_tasks_allocated) {
         num_tasks_allocated++;
     }
 
     // there is still space at the end of the task_list to write more task data
     if (num_tasks_allocated < MAX_NUM_TASKS) {
-        next_place_to_write_task_data = num_tasks_allocated;
+        task_list_write_pos = num_tasks_allocated;
     }
 
     // if there is no space at the end of task_list,
     // we have to find a spot that doesn't have task data
     else {
         do {
-            next_place_to_write_task_data = (next_place_to_write_task_data + 1) % MAX_NUM_TASKS;
-        } while ( task_list[next_place_to_write_task_data].dataPresent );
+            task_list_write_pos = (task_list_write_pos + 1) % MAX_NUM_TASKS;
+        } while ( task_list[task_list_write_pos].dataPresent );
     }
 
-    // if the new task also has the highest priority,
-    // load into the ready task queue
-    if (new_task->priority == task_list_head->priority) {
-        load_ready_task_queue();
-    }
+    load_ready_task_list();
 
     __asm__("cpsie if");
 }
@@ -164,7 +175,9 @@ static inline void delete_task(const void *funcPtr) {
                 else t1->nextTaskDataPtr = NULL;
             }
             current_num_tasks--;
-            next_place_to_write_task_data = GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(t2);
+            task_list_write_pos = GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(t2);
+
+            load_ready_task_list();
             break;
         }
         else {
@@ -176,69 +189,97 @@ static inline void delete_task(const void *funcPtr) {
     __asm__("cpsie if");
 }
 
-static inline void set_task_state(const void *funcPtr, uint8_t priority) {
-    // find the task to be deleted
-    TaskData *t1 = NULL;
-    TaskData *t2 = task_list_head;
-
-    while (t2) {
-        if (t2->funcPtr == funcPtr) {
-            t2->dataPresent == 0x00;
-            if (t1) {
-                if (t2->nextTaskDataPtr) t1->nextTaskDataPtr = t2->nextTaskDataPtr; 
-                else t1->nextTaskDataPtr = NULL;
-            }
-            current_num_tasks--;
-            next_place_to_write_task_data = GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(t2);
-
-            // if the task has the highest priority,
-            // load into the ready task queue
-            if (t2->priority == task_list_head->priority) {
-                load_ready_task_queue();
-            }
-            break;
-        }
-        else {
-            t1 = t2;
-            t2 = t2->nextTaskDataPtr;
-        }
-    }
+static inline void set_current_task_state(TaskState state) {
+    current_running_task->state = state;
+    load_ready_task_list();
 }
 
-static inline void delay_task(const void *funcPtr, uint32_t ticks_to_wait) {
+static inline void set_task_state(TaskData *taskPtr, TaskState state) {
+    taskPtr->state = TASK_READY;
+    load_ready_task_list();
+}
 
+static inline void delay_current_task(uint64_t ticks_to_wait) {
+    if (num_task_timers >= MAX_NUM_TASKS) return;
+
+    __asm__("cpsid if");
+
+    // add a new timer to the timer queue
+    uint64_t time_of_service = tick_count + ticks_to_wait;
+
+    TaskData *task = current_running_task;
+
+    // set the task state to blocked
+    set_task_state_direct(task, TASK_BLOCKED);
+
+    TaskTimer *new_timer = &task_timer_queue[task_timer_queue_write_pos];
+
+    *new_timer = (TaskTimer) { 
+        task, time_of_service, NULL
+    };
+
+    // if new_timer is not the only timer in the queue 
+    if (num_task_timers > 0) {
+        // change the pointers so the task is inserted into the linked list
+        TaskTimer    *t1 = NULL;
+        TaskTimer    *t2 = task_timer_queue_head;
+
+        // if t2 has a time_of_service gte to new_times's time_of_service, we want
+        // t1 --> new_task --> t2
+        while ( t2 && t2->time_of_service < time_of_service ) {
+            t1 = t2;
+            t2 = t2->nextTaskTimerPtr;
+        }
+
+        // new_timer is in the middle / end of the linked list
+        if (t1) t1->nextTaskTimerPtr = new_timer;
+        // new_timer is at the beginning of the linked list, i.e. it has the highest priority
+        else task_timer_queue_head = new_timer;
+
+        // new_timer is at the beginning / middle of the linked list
+        if (t2) new_timer->nextTaskTimerPtr = t2;
+    }
+    else {
+        task_timer_queue_head = new_timer;
+    }
+    num_task_timers++;
+
+    // set the next place to write task data
+    task_timer_queue_write_pos = (task_timer_queue_write_pos + 1) % MAX_NUM_TASKS;
+
+    __asm__("cpsie if");
 }
 
 __attribute__((naked)) void _on_scheduler_invoked(void) {
 
     /*
-    if (scheduler_enabled && ready_task_queue_size) {    
 
-        push_context();
+    if (scheduler_enabled) {    
 
-        current_running_task = ready_task_queue[round_robin_helper % ready_task_queue_size];
-        round_robin_helper++;
+        if (
+            num_task_timers && 
+            tick_count > task_timer_queue_head->time_of_service
+        ) {
+            set delayed task state to ready and recalculate ready queue
+        }
 
-        // SET THE SP TO THE NEW TASK 
+        if (num_ready_tasks)
+            next_task = ready_task_list[round_robin_helper % num_ready_tasks];
 
-        pop_context();
+        else
+            next_task = current_task
+
     }
     */
 
     __asm__(
         "CPSID  IF;"
         
-        // skip if scheduler isn't enabled or if
-        // there are no ready tasks
+        // skip everything if scheduler isn't enabled
         "LDR    R2, =scheduler_enabled;"
         "LDR    R1, [R2];"
         "CMP    R1, #0;"
-        "BEQ    _on_scheduler_invoked_end;"
-
-        "LDR    R2, =ready_task_queue_size;"
-        "LDR    R1, [R2];"
-        "CMP    R1, #0;"
-        "BEQ    _on_scheduler_invoked_end;"
+        "BEQ    _on_scheduler_invoked_skip_1;"
 
         // push remaining context
         "PUSH    {R4-R7};"
@@ -248,18 +289,78 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         "MOV     R7, R11;"
         "PUSH    {R4-R7};"
 
+        // if there are no delayed tasks, skip to choosing the next
+        // task to run
+        "LDR    R2, =num_task_timers;"
+        "LDR    R1, [R2];"
+        "CMP    R1, #0;"
+        "BEQ    _on_scheduler_invoked_skip_3;"
+
+        // if tick_count >= task_timer_queue_head->time_of_service,
+        // unblock the delayed task
+        // R3, R4 = tick_count
+        "LDR    R2, =tick_count;"
+        "LDR    R3, [R2];"
+        "LDR    R4, [R2, #4];"
+
+        // R2 = task_timer_queue_head
+        // R5, R6 = task_timer_queue_head->time_of_service
+        "LDR    R2, =task_timer_queue_head;"
+        "LDR    R2, [R2];"
+        "LDR    R5, [R2, #4];"
+        "LDR    R6, [R2, #8];"
+
+        "CMP    R4, R6;"
+        "BLT    _on_scheduler_invoked_skip_3;"
+        "BGT    _on_scheduler_invoked_skip_4;"
+
+        "CMP    R3, R5;"
+        "BLT    _on_scheduler_invoked_skip_3;"
+
+        "_on_scheduler_invoked_skip_4:"
+
+        // set the task at the head of the timer queue to ready state
+        // and add it to ready_task_list if applicable
+        // R0 = task_timer_queue_head->task
+        // R1 = 0 = TASK_READY
+        "MOV    R0, R2;"
+        "LDR    R0, [R0];"
+        "MOV    R1, #0;"
+        "BL     set_task_state;"
+
+        // task_timer_queue_head = task_timer_queue_head->nextTaskDataPtr
+        "LDR    R2, =task_timer_queue_head;"
+        "LDR    R0, [R2];"
+        "LDR    R1, [R0, #12]"
+        "STR    R1, [R0]"
+
+        // num_task_timers--
+        "LDR    R2, =num_task_timers;"
+        "LDR    R1, [R2];"
+        "SUB    R1, #1;"
+        "STR    R1, [R2];"
+
+        "_on_scheduler_invoked_skip_3:"
+
+        // skip choosing a new task if there are no ready tasks
+        // R1 = num_ready_tasks
+        "LDR    R2, =num_ready_tasks;"
+        "LDR    R1, [R2];"
+        "CMP    R1, #0;"
+        "BEQ    _on_scheduler_invoked_skip_2;"
+
         // save the current stack pointer
         // R2 = address of current_running_task
         "LDR    R2, =current_running_task;"
+        "LDR    R2, [R2]"
         "MOV    R0, SP"
         "STR    R0, [R2, #4]"
 
         // R0 = round_robin_helper
-        // R1 = ready_task_queue_size
         "LDR    R3, =round_robin_helper;"
         "LDR    R0, [R3];"
         
-        // R1 = round_robin_helper % ready_task_queue_size
+        // R1 = round_robin_helper % num_ready_tasks
         "BL     __aeabi_idivmod;"
 
         // round_robin_helper++
@@ -267,7 +368,7 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         "STR    R0, [R3];"
 
         // R3 = address of next task
-        "LDR    R3, =ready_task_queue;"
+        "LDR    R3, =ready_task_list;"
         // multiply R1 by 4 since each item in queue is 4 bytes
         "LSL    R1, R1, #2"
         "ADD    R3, R3, R1;"
@@ -282,6 +383,8 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         // set the new SP
         "MOV    SP, R4"
 
+        "_on_scheduler_invoked_skip_2:"
+
         // pop the next context
         "POP     {R4-R7};"
         "MOV     R8, R4;"
@@ -290,7 +393,7 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         "MOV     R11, R7;"
         "POP     {R4-R7};"
 
-        "_on_scheduler_invoked_end:"
+        "_on_scheduler_invoked_skip_1:"
 
         "CPSIE  IF;"
         "BX     LR;"
@@ -302,4 +405,3 @@ static inline void scheduler_init() {
     add_task(&idle_task, 0);
 
 }
-
