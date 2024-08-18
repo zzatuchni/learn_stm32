@@ -1,7 +1,4 @@
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdlib.h>
+#include "rtos.h"
 
 ////////////////////////////////////////////////////////////
 //  Misc
@@ -184,10 +181,10 @@ static inline void systick_init(uint32_t ticks) {
     RCC->APB2ENR |= BIT(14);
 }
 
-__attribute__((used)) static volatile uint32_t num_ticks;
-void _on_systick_interrupt(void) {
-    num_ticks++;
-}
+//__attribute__((used)) static volatile uint32_t num_ticks;
+//void _on_systick_interrupt(void) {
+//    num_ticks++;
+//}
 
 ////////////////////////////////////////////////////////////
 //  UART
@@ -251,26 +248,8 @@ static inline void uart_write_buf(char *buf, size_t len) {
 #define COMMAND_MAX_LENGTH 64
 __attribute__((used)) static volatile uint8_t command_buffer[COMMAND_MAX_LENGTH];
 __attribute__((used)) static volatile uint8_t current_command_length = 0;
-__attribute__((used)) static volatile bool command_finished = false;
+//__attribute__((used)) static volatile bool command_finished = false;
 
-void _on_uart2_interrupt(void) {
-    uint8_t byte = uart_read_byte();
-    if (byte == 0x08 || byte == 0x7F) {
-        if (current_command_length > 0) {
-            current_command_length--;
-            uart_write_byte(byte);
-        }
-        return;
-    }
-    if (current_command_length < COMMAND_MAX_LENGTH) {
-        command_buffer[current_command_length] = byte;
-        current_command_length++;
-        uart_write_byte(byte);
-    }
-    if (byte == '\r') {
-        command_finished = true;
-    }
-}
 
 ////////////////////////////////////////////////////////////
 //  Button
@@ -285,24 +264,76 @@ static inline void button_init(STM32_Pin button_pin) {
     exti_enable(button_pin, EXTI_TRIGGER_ON_FALL);
 }
 
-__attribute__((used)) static volatile bool led_on = false;
-
-void _on_button_press(void) {
-    EXTI_Regs *exti = (EXTI_Regs *)EXTI_START_ADDRESS;
-    exti->PR |= (1UL << BUTTON_PIN_NUMBER);
-    
-    led_on = !led_on;
-    STM32_Pin led_pin = {LED_PIN_BANK, LED_PIN_NUMBER};
-    gpio_write(led_on, led_pin);
-}
 
 ////////////////////////////////////////////////////////////
-//  Main code
+//  Tasks
 ////////////////////////////////////////////////////////////
 
 void handle_command(char *command, uint8_t length) {
     uart_write_buf(command, length);
 }
+
+void led_task() {
+    STM32_Pin led_pin = {LED_PIN_BANK, LED_PIN_NUMBER};
+    for (;;) {
+        gpio_write(true, led_pin);
+        delay_current_task(1000);
+        gpio_write(false, led_pin);
+        delay_current_task(1000);
+    }
+}
+
+// NOTE: add lock to reserve uart
+void button_task() {
+    for(;;) {
+        uart_write_buf("BUTTON PRESSED\r\n", 16);
+        set_current_task_state(TASK_BLOCKED);
+    }
+}
+
+void uart_task() {
+    for (;;) {
+        uint8_t byte = uart_read_byte();
+        if (byte == 0x08 || byte == 0x7F) {
+            if (current_command_length > 0) {
+                current_command_length--;
+                uart_write_byte(byte);
+            }
+            return;
+        }
+        if (current_command_length < COMMAND_MAX_LENGTH) {
+            command_buffer[current_command_length] = byte;
+            current_command_length++;
+            uart_write_byte(byte);
+        }
+        if (byte == '\r') {
+            uart_write_buf("\r\n", 2);
+            handle_command((char *)command_buffer, (uint8_t)current_command_length);
+            uart_write_buf("\r\n>> ", 5);
+            current_command_length = 0;
+        }
+        set_current_task_state(TASK_BLOCKED);
+    }
+}
+
+////////////////////////////////////////////////////////////
+//  Interrupts
+////////////////////////////////////////////////////////////
+
+void _on_button_press(void) {
+    EXTI_Regs *exti = (EXTI_Regs *)EXTI_START_ADDRESS;
+    exti->PR |= (1UL << BUTTON_PIN_NUMBER);
+
+    set_task_state_from_func(&button_task, TASK_READY);
+}
+
+void _on_uart2_interrupt(void) {
+    uart_task(&button_task, TASK_READY);
+}
+
+////////////////////////////////////////////////////////////
+//  Main code
+////////////////////////////////////////////////////////////
 
 int main(void) {
 
@@ -320,18 +351,13 @@ int main(void) {
     STM32_Pin button_pin = {BUTTON_PIN_BANK, BUTTON_PIN_NUMBER};
     button_init(button_pin);
 
-    // START LOOP
+    //  INITIALIZE SCHEDULER
+    add_task(&button_task, 4);
+    add_task(&uart_task, 3);
+    add_task(&led_task, 2);
+    scheduler_init();
 
-    uart_write_buf("\r\n>> ", 5);
-    for (;;) {
-        if (command_finished) {
-            uart_write_buf("\r\n", 2);
-            handle_command((char *)command_buffer, (uint8_t)current_command_length);
-            uart_write_buf("\r\n>> ", 5);
-            current_command_length = 0;
-            command_finished = false;
-        }
-    }
+    for (;;) {}
     
     return 0;
 }
@@ -355,7 +381,7 @@ extern void _estack(void);  // Defined in link.ld
 
 // 16 standard and 91 STM32-specific handlers
 __attribute__((section(".vectors"))) void (*const volatile tab[16 + 99])(void) = {
-    _estack, _reset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _on_systick_interrupt,  //ARM core interrupts
+    _estack, _reset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _on_scheduler_invoked,  //ARM core interrupts
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
     0, 0, 0, 0, 0, 0, _on_uart2_interrupt, 0, _on_button_press, 0, 0, 0, 0, 0, 0, 0, // 32 - 47
