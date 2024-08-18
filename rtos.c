@@ -1,57 +1,4 @@
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdlib.h>
-
-#define MAX_NUM_TASKS 8
-#define TASK_STACK_SIZE 1024
-
-typedef enum {
-    TASK_READY, TASK_BLOCKED
-} TaskState;
-
-typedef struct {
-    const    void        (*funcPtr)(void);
-
-    volatile void        *stackPtr;
-    volatile TaskState   state;
-    volatile uint8_t     priority;
-    volatile TaskData    *nextTaskDataPtr;
-
-    volatile uint8_t     dataPresent;
-
-} TaskData;
-
-__attribute__((used)) static volatile bool      scheduler_enabled   = false;
-__attribute__((used)) static volatile uint64_t  tick_count          = 0;
-__attribute__((used)) static volatile uint8_t   round_robin_helper  = 0;
-
-__attribute__((used)) static volatile TaskData  task_list[MAX_NUM_TASKS];
-#define GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(x) (((x) - (&task_list[0]))/(sizeof(TaskData)))
-__attribute__((used)) static volatile TaskData  *task_list_head                 = NULL;
-__attribute__((used)) static volatile TaskData  *current_running_task           = NULL;
-
-__attribute__((used)) static volatile uint8_t   task_list_write_pos             = 0;
-__attribute__((used)) static volatile uint8_t   current_num_tasks               = 0;
-__attribute__((used)) static volatile uint8_t   num_tasks_allocated             = 0;
-
-__attribute__((used)) static volatile TaskData  *ready_task_list[MAX_NUM_TASKS];
-__attribute__((used)) static volatile uint8_t   num_ready_tasks                 = 0;
-
-__attribute__((used)) static volatile uint8_t   task_stack_space[MAX_NUM_TASKS][TASK_STACK_SIZE];
-
-// NOTE: handle time_of_service overflow eventually
-typedef struct {
-    const    TaskData   *task;
-    volatile uint64_t   time_of_service;
-    volatile TaskTimer  *nextTaskTimerPtr;
-
-} TaskTimer;
-
-__attribute__((used)) static volatile TaskTimer task_timer_queue[MAX_NUM_TASKS];
-__attribute__((used)) static volatile TaskTimer *task_timer_queue_head          = NULL;
-__attribute__((used)) static volatile uint8_t   task_timer_queue_write_pos      = 0;
-__attribute__((used)) static volatile uint8_t   num_task_timers                 = 0;
+#include "rtos.h"
 
 static void idle_task(void) {
     for (;;) {}
@@ -195,7 +142,17 @@ static inline void set_current_task_state(TaskState state) {
 }
 
 static inline void set_task_state(TaskData *taskPtr, TaskState state) {
-    taskPtr->state = TASK_READY;
+    taskPtr->state = state;
+    load_ready_task_list();
+}
+
+static inline void set_task_state_from_func(const void *funcPtr, TaskState state) {
+    TaskData *t1 = task_list_head;
+
+    while (t1 && t1->funcPtr == funcPtr) t1 = t1->nextTaskDataPtr;
+
+    if (t1) t1->state == state;
+
     load_ready_task_list();
 }
 
@@ -253,22 +210,17 @@ static inline void delay_current_task(uint64_t ticks_to_wait) {
 __attribute__((naked)) void _on_scheduler_invoked(void) {
 
     /*
-
     if (scheduler_enabled) {    
-
         if (
             num_task_timers && 
             tick_count > task_timer_queue_head->time_of_service
         ) {
             set delayed task state to ready and recalculate ready queue
         }
-
         if (num_ready_tasks)
             next_task = ready_task_list[round_robin_helper % num_ready_tasks];
-
         else
             next_task = current_task
-
     }
     */
 
@@ -331,8 +283,8 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         // task_timer_queue_head = task_timer_queue_head->nextTaskDataPtr
         "LDR    R2, =task_timer_queue_head;"
         "LDR    R0, [R2];"
-        "LDR    R1, [R0, #12]"
-        "STR    R1, [R0]"
+        "LDR    R1, [R0, #12];"
+        "STR    R1, [R0];"
 
         // num_task_timers--
         "LDR    R2, =num_task_timers;"
@@ -352,9 +304,9 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         // save the current stack pointer
         // R2 = address of current_running_task
         "LDR    R2, =current_running_task;"
-        "LDR    R2, [R2]"
-        "MOV    R0, SP"
-        "STR    R0, [R2, #4]"
+        "LDR    R2, [R2];"
+        "MOV    R0, SP;"
+        "STR    R0, [R2, #4];"
 
         // R0 = round_robin_helper
         "LDR    R3, =round_robin_helper;"
@@ -370,18 +322,18 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
         // R3 = address of next task
         "LDR    R3, =ready_task_list;"
         // multiply R1 by 4 since each item in queue is 4 bytes
-        "LSL    R1, R1, #2"
+        "LSL    R1, R1, #2;"
         "ADD    R3, R3, R1;"
         "LDR    R3, [R3];"
 
         // set current_running_task
-        "STR    R3, [R2]"
+        "STR    R3, [R2];"
 
         // R4 = new SP
-        "LDR    R4, [R3, #4]"
+        "LDR    R4, [R3, #4];"
 
         // set the new SP
-        "MOV    SP, R4"
+        "MOV    SP, R4;"
 
         "_on_scheduler_invoked_skip_2:"
 
@@ -403,5 +355,6 @@ __attribute__((naked)) void _on_scheduler_invoked(void) {
 static inline void scheduler_init() {
     //  ADD IDLE TASK
     add_task(&idle_task, 0);
+    scheduler_enabled = true;
 
 }
