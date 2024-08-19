@@ -273,34 +273,39 @@ void handle_command(char *command, uint8_t length) {
     uart_write_buf(command, length);
 }
 
+__attribute__((used)) volatile bool         led_on = false;
 void led_task() {
     STM32_Pin led_pin = {LED_PIN_BANK, LED_PIN_NUMBER};
     for (;;) {
-        gpio_write(true, led_pin);
+        gpio_write(led_on, led_pin);
+        led_on = !led_on;
         delay_current_task(1000);
-        gpio_write(false, led_pin);
-        delay_current_task(1000);
+        
     }
 }
 
 // NOTE: add lock to reserve uart
 void button_task() {
     for(;;) {
-        uart_write_buf("BUTTON PRESSED\r\n", 16);
         set_current_task_state(TASK_BLOCKED);
+        uart_write_buf("BUTTON PRESSED\r\n", 16);
     }
 }
 
+__attribute__((used)) volatile uint8_t      uart_byte = 0x00;
 void uart_task() {
     for (;;) {
-        uint8_t byte = uart_read_byte();
+        set_current_task_state(TASK_BLOCKED);
+        uint8_t byte = uart_byte;
+        bool bkspc_check = true;
         if (byte == 0x08 || byte == 0x7F) {
             if (current_command_length > 0) {
                 current_command_length--;
                 uart_write_byte(byte);
             }
-            return;
+            bkspc_check = false;
         }
+        if (!bkspc_check) continue;
         if (current_command_length < COMMAND_MAX_LENGTH) {
             command_buffer[current_command_length] = byte;
             current_command_length++;
@@ -312,7 +317,6 @@ void uart_task() {
             uart_write_buf("\r\n>> ", 5);
             current_command_length = 0;
         }
-        set_current_task_state(TASK_BLOCKED);
     }
 }
 
@@ -327,8 +331,26 @@ void _on_button_press(void) {
     set_task_state_from_func(&button_task, TASK_READY);
 }
 
+
 void _on_uart2_interrupt(void) {
-    uart_task(&button_task, TASK_READY);
+    uart_byte = uart_read_byte();
+    set_task_state_from_func(&uart_task, TASK_READY);
+}
+
+void _on_hard_fault(void) {
+    uart_write_buf("*HF*", 4);
+}
+
+void _on_mem_fault(void) {
+    uart_write_buf("*MF*", 4);
+}
+
+void _on_bus_fault(void) {
+    uart_write_buf("*BF*", 4);
+}
+
+void _on_usage_fault(void) {
+    uart_write_buf("*UF*", 4);
 }
 
 ////////////////////////////////////////////////////////////
@@ -381,7 +403,7 @@ extern void _estack(void);  // Defined in link.ld
 
 // 16 standard and 91 STM32-specific handlers
 __attribute__((section(".vectors"))) void (*const volatile tab[16 + 99])(void) = {
-    _estack, _reset, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, _on_scheduler_invoked,  //ARM core interrupts
+    _estack, _reset, 0, _on_hard_fault, _on_mem_fault, _on_bus_fault, _on_usage_fault, 0, 0, 0, 0, 0, 0, 0, 0, _on_scheduler_invoked,  //ARM core interrupts
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
     0, 0, 0, 0, 0, 0, _on_uart2_interrupt, 0, _on_button_press, 0, 0, 0, 0, 0, 0, 0, // 32 - 47

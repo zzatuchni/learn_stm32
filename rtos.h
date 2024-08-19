@@ -3,15 +3,21 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-#define MAX_NUM_TASKS 4
-#define TASK_STACK_SIZE 1024
+#define MAX_NUM_TASKS   4
+#define TASK_STACK_SIZE 512
+
+extern volatile uint8_t   isr_lock;
+void increment_isr_lock();
+void decrement_isr_lock();
 
 typedef enum {
     TASK_READY, TASK_BLOCKED
 } TaskState;
 
-typedef struct {
-    const    void        (*funcPtr)(void);
+typedef struct TaskData TaskData;
+
+struct TaskData {
+    void        (*funcPtr)(void);
 
     volatile void        *stackPtr;
     volatile TaskState   state;
@@ -20,55 +26,56 @@ typedef struct {
 
     volatile uint8_t     dataPresent;
 
-} TaskData;
+};
 
-__attribute__((used)) static volatile bool      scheduler_enabled   = false;
-__attribute__((used)) static volatile uint64_t  tick_count          = 0;
-__attribute__((used)) static volatile uint8_t   round_robin_helper  = 0;
+extern volatile bool      scheduler_enabled;
+extern volatile uint64_t  tick_count;
+extern volatile uint32_t  round_robin_helper;
 
-__attribute__((used)) static volatile TaskData  task_list[MAX_NUM_TASKS];
-#define GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(x) (((x) - (&task_list[0]))/(sizeof(TaskData)))
-__attribute__((used)) static volatile TaskData  *task_list_head                 = NULL;
-__attribute__((used)) static volatile TaskData  *current_running_task           = NULL;
+extern volatile TaskData  task_list[MAX_NUM_TASKS];
+#define GET_TASK_LIST_INDEX_FROM_MEMORY_LOCATION(x) ((uint32_t)((x) - (&task_list[0]))/((uint32_t)sizeof(TaskData)))
+extern volatile TaskData  *task_list_head;
+extern volatile TaskData  *current_running_task;
 
-__attribute__((used)) static volatile uint8_t   task_list_write_pos             = 0;
-__attribute__((used)) static volatile uint8_t   current_num_tasks               = 0;
-__attribute__((used)) static volatile uint8_t   num_tasks_allocated             = 0;
+extern volatile uint8_t   task_list_write_pos;
+extern volatile uint8_t   current_num_tasks;
+extern volatile uint8_t   num_tasks_allocated;
 
-__attribute__((used)) static volatile TaskData  *ready_task_list[MAX_NUM_TASKS];
-__attribute__((used)) static volatile uint8_t   num_ready_tasks                 = 0;
+extern volatile TaskData  *ready_task_list[MAX_NUM_TASKS];
+extern volatile uint8_t   num_ready_tasks;
 
-__attribute__((used)) static volatile uint8_t   task_stack_space[MAX_NUM_TASKS][TASK_STACK_SIZE];
+extern volatile uint32_t  task_stack_space[MAX_NUM_TASKS][TASK_STACK_SIZE];
+
+typedef struct TaskTimer TaskTimer;
 
 // NOTE: handle time_of_service overflow eventually
-typedef struct {
+struct TaskTimer {
     const    TaskData   *task;
     volatile uint64_t   time_of_service;
     volatile TaskTimer  *nextTaskTimerPtr;
+};
 
-} TaskTimer;
+extern volatile TaskTimer task_timer_queue[MAX_NUM_TASKS];
+extern volatile TaskTimer *task_timer_queue_head;
+extern volatile uint8_t   task_timer_queue_write_pos;
+extern volatile uint8_t   num_task_timers;
 
-__attribute__((used)) static volatile TaskTimer task_timer_queue[MAX_NUM_TASKS];
-__attribute__((used)) static volatile TaskTimer *task_timer_queue_head          = NULL;
-__attribute__((used)) static volatile uint8_t   task_timer_queue_write_pos      = 0;
-__attribute__((used)) static volatile uint8_t   num_task_timers                 = 0;
+__attribute__((used)) void idle_task(void);
 
-static void idle_task(void);
+void load_ready_task_list();
 
-static inline void load_ready_task_list();
+void add_task(const void *funcPtr, uint8_t priority);
 
-static inline void add_task(const void *funcPtr, uint8_t priority);
+void delete_task(const void *funcPtr);
 
-static inline void delete_task(const void *funcPtr);
+void set_current_task_state(TaskState state);
 
-static inline void set_current_task_state(TaskState state);
+void set_task_state(TaskData *taskPtr, TaskState state);
 
-static inline void set_task_state(TaskData *taskPtr, TaskState state);
+void set_task_state_from_func(const void *funcPtr, TaskState state);
 
-static inline void set_task_state_from_func(const void *funcPtr, TaskState state);
-
-static inline void delay_current_task(uint64_t ticks_to_wait);
+void delay_current_task(uint64_t ticks_to_wait);
 
 __attribute__((naked)) void _on_scheduler_invoked(void);
 
-static inline void scheduler_init();
+void scheduler_init();

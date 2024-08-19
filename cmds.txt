@@ -1,0 +1,11 @@
+st-util
+arm-none-eabi-gdb main.elf
+target extended-remote:4242
+load
+b _on_scheduler_invoked
+b _on_hard_fault
+b _on_mem_fault
+b _on_bus_fault
+b _on_usage_fault
+print/x *(uint32_t *) 0xE000ED28
+
