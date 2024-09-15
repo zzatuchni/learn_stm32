@@ -131,7 +131,7 @@ void add_task(const void *funcPtr, uint8_t priority) {
     // we have to find a spot that doesn't have task data
     else {
         do {
-            task_list_write_pos = (task_list_write_pos + 1U) % ((uint8_t) MAX_NUM_TASKS);
+            task_list_write_pos = (uint8_t)((task_list_write_pos + 1U) % ((uint8_t) MAX_NUM_TASKS));
         } while ( task_list[task_list_write_pos].dataPresent );
     }
 
@@ -247,7 +247,7 @@ void delay_current_task(uint64_t ticks_to_wait) {
     num_task_timers++;
 
     // set the next place to write task data
-    task_timer_queue_write_pos = (task_timer_queue_write_pos + 1U) % ((uint8_t) MAX_NUM_TASKS);
+    task_timer_queue_write_pos = (uint8_t)((task_timer_queue_write_pos + 1U) % ((uint8_t) MAX_NUM_TASKS));
 
     // set the task state to blocked
     set_task_state(task, TASK_BLOCKED);

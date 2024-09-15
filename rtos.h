@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 
-#define MAX_NUM_TASKS   4
+#define MAX_NUM_TASKS   5
 #define TASK_STACK_SIZE 512
 
 extern volatile uint8_t   isr_lock;

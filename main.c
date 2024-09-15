@@ -7,7 +7,7 @@
 #define FREQ 16000000 
 #define BIT(x) (1UL << x)
 
-static inline void spin(uint32_t count) {
+ __attribute__((optimize("O0"))) static inline void spin(uint32_t count) {
     while (count--) asm("nop");
 }
 
@@ -91,6 +91,17 @@ static inline void exti_enable(STM32_Pin pin, EXTI_Mode trigger_mode) {
 }
 
 ////////////////////////////////////////////////////////////
+//  Flash
+////////////////////////////////////////////////////////////
+
+#define FLASH_REGS_START_ADDRESS 0x40023C00
+typedef struct {
+    volatile uint32_t ACR, KEYR, OPTKEYR, SR, CR, OPTCR;
+} Flash_Regs;
+
+#define FLASH ((Flash_Regs *) FLASH_REGS_START_ADDRESS)
+
+////////////////////////////////////////////////////////////
 //  RCC
 ////////////////////////////////////////////////////////////
 
@@ -103,6 +114,36 @@ typedef struct {
         RESERVED6[2], SSCGR, PLLI2SCFGR;
 } RCC_Regs;
 #define RCC ((RCC_Regs *) RCC_START_ADDRESS)
+
+static inline void clock_init() {
+    // Reset the Flash 'Access Control Register', and
+    // then set 1 wait-state and enable the prefetch buffer.
+    // (The device header files only show 1 bit for the F0
+    //  line, but the reference manual shows 3...)
+    FLASH->ACR &= ~(0x00000017U);
+    FLASH->ACR |=  (0x1U |
+                    (0x1U << 4U));
+
+    // Configure the PLL to (HSI) * 3 = 48MHz.
+    // Use a PLLMUL of 0xA for *12, and keep PLLSRC at 0
+    // to use (HSI / PREDIV) as the core source. HSI = 8MHz.
+   
+    RCC->PLLCFGR  &= ~(uint32_t)(0x111111111111111U);
+    RCC->PLLCFGR  &=  ~BIT(22);
+    RCC->PLLCFGR  |=  (0x3U << 6U);
+    // Turn the PLL on and wait for it to be ready.
+    RCC->CR    |=  (BIT(24));
+    while (!(RCC->CR & BIT(25))) {};
+
+    // Select the PLL as the system clock source.
+    RCC->CFGR  &= ~(0x3U);
+
+    RCC->CFGR  |=  (0x00000002U);
+    spin(2000000);
+    
+
+    while (!(RCC->CFGR & (BIT(3)))) {};
+}
 
 ////////////////////////////////////////////////////////////
 //  GPIO
@@ -121,6 +162,14 @@ typedef enum {
     GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_MODE_AF, GPIO_MODE_ANALOG 
 } GPIO_Mode;
 
+typedef enum { 
+    GPIO_SPEED_LOW, GPIO_SPEED_MED, GPIO_SPEED_FAST, GPIO_SPEED_HIGH 
+} GPIO_Speed;
+
+typedef enum { 
+    GPIO_PP_PULL_DOWN_ONLY, GPIO_PP_PULL_UP, GPIO_PP_PULL_DOWN 
+} GPIO_PushPull;
+
 typedef uint8_t GPIO_AF;
 
 static inline void gpio_set_mode(GPIO_Mode mode, STM32_Pin pin) {
@@ -136,6 +185,27 @@ static inline void gpio_set_af(GPIO_AF af, STM32_Pin pin) {
     int n = pin.number;
     gpio->AFR[n >> 3] &= ~(15UL << ((n & 7) * 4));              //reset af
     gpio->AFR[n >> 3] |= (((uint32_t) af) << ((n & 7) * 4));    //set to new mode
+}
+
+static inline void gpio_set_speed(GPIO_Speed spd, STM32_Pin pin) {
+    GPIO_Bank *gpio = GET_GPIO_BANK(pin.bank); 
+    int n = pin.number;
+    gpio->OSPEEDR &= ~(3U << (n * 2));           //reset speed
+    gpio->OSPEEDR |= ((spd & 3U) << (n * 2));    //set to new speed
+}
+
+static inline void gpio_set_otyper(bool is_open_drain, STM32_Pin pin) {
+    GPIO_Bank *gpio = GET_GPIO_BANK(pin.bank); 
+    int n = pin.number;
+    gpio->OTYPER &= ~(1U << (n));                     //reset otyper
+    gpio->OTYPER |= ((is_open_drain & 1U) << (n));    //set to new otyper
+}
+
+static inline void gpio_set_pupdr(GPIO_PushPull pp, STM32_Pin pin) {
+    GPIO_Bank *gpio = GET_GPIO_BANK(pin.bank); 
+    int n = pin.number;
+    gpio->PUPDR &= ~(3U << (n * 2));            //reset pupdr
+    gpio->PUPDR |= ((pp & 3U) << (n * 2));      //set to new pupdr
 }
 
 static inline void gpio_write(bool value, STM32_Pin pin) {
@@ -202,8 +272,8 @@ static inline void systick_init(uint32_t ticks) {
 
 typedef struct {
     volatile uint32_t SR, DR, BRR, CR1, CR2, CR3, GTPR;
-} UART_REGS;
-#define UART2 ((UART_REGS *) UART2_START_ADDRESS)
+} UART_Regs;
+#define UART2 ((UART_Regs *) UART2_START_ADDRESS)
 
 static inline void uart_init() {
     RCC->APB1ENR |= BIT(17);
@@ -264,6 +334,252 @@ static inline void button_init(STM32_Pin button_pin) {
     exti_enable(button_pin, EXTI_TRIGGER_ON_FALL);
 }
 
+////////////////////////////////////////////////////////////
+//  SPI / LCD
+////////////////////////////////////////////////////////////
+
+#define SPI_CS_PIN      (STM32_Pin){'B', 6}
+//#define SPI_SCLK_PIN    (STM32_Pin){'B', 3}
+#define SPI_SCLK_PIN    (STM32_Pin){'A', 5}
+#define SPI_MISO_PIN    (STM32_Pin){'A', 6}
+#define SPI_MOSI_PIN    (STM32_Pin){'A', 7}
+#define SPI_DC_PIN      (STM32_Pin){'A', 10}
+#define SPI_RST_PIN     (STM32_Pin){'A', 8}
+
+#define SPI1_START_ADDRESS 0x40013000
+#define SPI1_BAUD_CONTROL 0x0
+typedef struct {
+    volatile uint32_t CR1, CR2, SR, DR, CRCPR, RXCRCR, TXCRCR, I2SCFGR, I2SPR;
+} SPI_Regs;
+
+#define SPI1 ((SPI_Regs *) SPI1_START_ADDRESS)
+
+typedef struct {
+    volatile STM32_Pin CS, SCLK, MISO, MOSI, RST, DC;
+} SPI_Pins;
+
+static inline void spi_gpio_init(SPI_Pins *spi_pins) {
+    // set up gpio pins
+    
+    gpio_set_mode(GPIO_MODE_OUTPUT, spi_pins->CS);
+    gpio_set_pupdr(GPIO_PP_PULL_DOWN_ONLY, spi_pins->CS);
+    gpio_set_otyper(false, spi_pins->CS);
+
+    gpio_set_mode(GPIO_MODE_AF, spi_pins->SCLK);
+    gpio_set_speed(GPIO_SPEED_HIGH, spi_pins->SCLK);
+    gpio_set_pupdr(GPIO_PP_PULL_UP, spi_pins->SCLK);
+    gpio_set_af(5, spi_pins->SCLK);
+    gpio_set_otyper(false, spi_pins->SCLK);
+
+    gpio_set_mode(GPIO_MODE_AF, spi_pins->MISO);
+    gpio_set_speed(GPIO_SPEED_HIGH, spi_pins->MISO);
+    gpio_set_pupdr(GPIO_PP_PULL_UP, spi_pins->MISO);
+    gpio_set_af(5, spi_pins->MISO);
+    gpio_set_otyper(false, spi_pins->MISO);
+
+    gpio_set_mode(GPIO_MODE_AF, spi_pins->MOSI);
+    gpio_set_speed(GPIO_SPEED_FAST, spi_pins->MOSI);
+    gpio_set_pupdr(GPIO_PP_PULL_UP, spi_pins->MOSI);
+    gpio_set_af(5, spi_pins->MOSI);
+    gpio_set_otyper(false, spi_pins->MOSI);
+
+    gpio_set_mode(GPIO_MODE_OUTPUT, spi_pins->RST);
+    gpio_set_pupdr(GPIO_PP_PULL_DOWN_ONLY, spi_pins->RST);
+    gpio_set_otyper(false, spi_pins->RST);
+
+    gpio_set_mode(GPIO_MODE_OUTPUT, spi_pins->DC);
+    gpio_set_speed(GPIO_SPEED_HIGH, spi_pins->DC);
+    gpio_set_pupdr(GPIO_PP_PULL_DOWN_ONLY, spi_pins->DC);
+    gpio_set_otyper(false, spi_pins->DC);
+    
+
+    RCC->APB2ENR |= BIT(12);
+}
+
+static inline void spi_regs_init() {
+    SPI1->CR1 &= ~BIT(6);
+    RCC->APB2RSTR |=  BIT(12);
+    RCC->APB2RSTR &= ~BIT(12);
+
+    SPI1->CR1 |= BIT(0) | BIT(1) | BIT(2) | BIT(8) | BIT(9);
+
+    SPI1->CR1 |= (SPI1_BAUD_CONTROL << 3);
+    SPI1->CR1 |= BIT(6);
+}
+
+static inline void lcd_write_byte(uint8_t dat) {
+    while (!(SPI1->SR & BIT(1))) {};
+    *(uint8_t*)&(SPI1->DR) = dat;
+}
+
+static inline void lcd_write_word(uint16_t dat) {
+    lcd_write_byte((uint8_t)(dat >> 8));
+    lcd_write_byte((uint8_t)(dat & 0xFF));
+}
+
+static inline void lcd_write_cmd(SPI_Pins *spi, uint8_t cmd) {
+    while ((SPI1->SR & BIT(7))) {};
+    gpio_write(false, spi->DC);
+    lcd_write_byte(cmd);
+    while ((SPI1->SR & BIT(7))) {};
+    gpio_write(true, spi->DC);
+}
+
+/*
+static inline void sspi_w(uint8_t dat) {
+  uint8_t sspi_i;
+  // Send 8 bits, with the MSB first.
+  GPIO_Bank *GPIOA = GET_GPIO_BANK('A');
+  for (sspi_i = 0x80; sspi_i != 0x00; sspi_i >>= 1) {
+    GPIOA->ODR &= ~(1 << PB_SCK);
+    if (dat & sspi_i) {
+      GPIOA->ODR |=  (1 << PB_MOSI);
+    }
+    else {
+      GPIOA->ODR &= ~(1 << PB_MOSI);
+    }
+    GPIOA->ODR |=  (1 << PB_SCK);
+  }
+}
+*/
+
+/*
+static inline void sspi_cmd(uint8_t cdat) {
+  // Pull the 'D/C' pin low, write data, pull 'D/C' high.
+  GPIO_Bank *GPIOA = GET_GPIO_BANK('A');
+  GPIOA->ODR &= ~(1 << PB_DC);
+  sspi_w(cdat);
+  GPIOA->ODR |=  (1 << PB_DC);
+}
+*/
+
+static inline void lcd_init(SPI_Pins *spi) {
+    spi_gpio_init(spi);
+
+    // initial values
+    gpio_write(true, spi->CS);
+    gpio_write(true, spi->DC);
+    gpio_write(true, spi->SCLK);
+
+    gpio_write(false, spi->RST);
+    spin(2000000);
+    gpio_write(true, spi->RST);
+    spin(2000000);
+
+    // set up spi register
+    spi_regs_init();
+
+    gpio_write(false, spi->CS);
+
+    // lcd setup
+    lcd_write_cmd(spi, 0xEF);
+    lcd_write_byte(0x03);
+    lcd_write_byte(0x80);
+    lcd_write_byte(0x02);
+    lcd_write_cmd(spi, 0xCF);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0xC1);
+    lcd_write_byte(0x30);
+    lcd_write_cmd(spi, 0xED);
+    lcd_write_byte(0x64);
+    lcd_write_byte(0x03);
+    lcd_write_byte(0x12);
+    lcd_write_byte(0x81);
+    lcd_write_cmd(spi, 0xE8);
+    lcd_write_byte(0x85);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x78);
+    lcd_write_cmd(spi, 0xCB);
+    lcd_write_byte(0x39);
+    lcd_write_byte(0x2C);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x34);
+    lcd_write_byte(0x02);
+    lcd_write_cmd(spi, 0xF7);
+    lcd_write_byte(0x20);
+    lcd_write_cmd(spi, 0xEA);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x00);
+    // PWCTR1
+    lcd_write_cmd(spi, 0xC0);
+    lcd_write_byte(0x23);
+    // PWCTR2
+    lcd_write_cmd(spi, 0xC1);
+    lcd_write_byte(0x10);
+    // VMCTR1
+    lcd_write_cmd(spi, 0xC5);
+    lcd_write_byte(0x3E);
+    lcd_write_byte(0x28);
+    // VMCTR2
+    lcd_write_cmd(spi, 0xC7);
+    lcd_write_byte(0x86);
+    // MADCTL
+    lcd_write_cmd(spi, 0x36);
+    lcd_write_byte(0x48);
+    // VSCRSADD
+    lcd_write_cmd(spi, 0x37);
+    lcd_write_byte(0x00);
+    // PIXFMT
+    lcd_write_cmd(spi, 0x3A);
+    lcd_write_byte(0x55);
+    // FRMCTR1
+    lcd_write_cmd(spi, 0xB1);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x18);
+    // DFUNCTR
+    lcd_write_cmd(spi, 0xB6);
+    lcd_write_byte(0x08);
+    lcd_write_byte(0x82);
+    lcd_write_byte(0x27);
+    lcd_write_cmd(spi, 0xF2);
+    lcd_write_byte(0x00);
+    // GAMMASET
+    lcd_write_cmd(spi, 0x26);
+    lcd_write_byte(0x01);
+    // (Actual gamma settings)
+    lcd_write_cmd(spi, 0xE0);
+    lcd_write_byte(0x0F);
+    lcd_write_byte(0x31);
+    lcd_write_byte(0x2B);
+    lcd_write_byte(0x0C);
+    lcd_write_byte(0x0E);
+    lcd_write_byte(0x08);
+    lcd_write_byte(0x4E);
+    lcd_write_byte(0xF1);
+    lcd_write_byte(0x37);
+    lcd_write_byte(0x07);
+    lcd_write_byte(0x10);
+    lcd_write_byte(0x03);
+    lcd_write_byte(0x0E);
+    lcd_write_byte(0x09);
+    lcd_write_byte(0x00);
+    lcd_write_cmd(spi, 0xE1);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x0E);
+    lcd_write_byte(0x14);
+    lcd_write_byte(0x03);
+    lcd_write_byte(0x11);
+    lcd_write_byte(0x07);
+    lcd_write_byte(0x31);
+    lcd_write_byte(0xC1);
+    lcd_write_byte(0x48);
+    lcd_write_byte(0x08);
+    lcd_write_byte(0x0F);
+    lcd_write_byte(0x0C);
+    lcd_write_byte(0x31);
+    lcd_write_byte(0x36);
+    lcd_write_byte(0x0F);
+    
+    // Exit sleep mode.
+    lcd_write_cmd(spi, 0x11);
+    spin(2000000);
+    // Display on.
+    lcd_write_cmd(spi, 0x29);
+    spin(2000000);
+    // 'Normal' display mode.
+    lcd_write_cmd(spi, 0x13);
+}
+
 
 ////////////////////////////////////////////////////////////
 //  Tasks
@@ -284,11 +600,11 @@ void led_task() {
     }
 }
 
-// NOTE: add lock to reserve uart
+__attribute__((used)) volatile uint8_t     lcd_color_num = 0;
 void button_task() {
     for(;;) {
         set_current_task_state(TASK_BLOCKED);
-        uart_write_buf("BUTTON PRESSED\r\n", 16);
+        lcd_color_num = (uint8_t)(lcd_color_num + 1) % 4;
     }
 }
 
@@ -316,6 +632,54 @@ void uart_task() {
             handle_command((char *)command_buffer, (uint8_t)current_command_length);
             uart_write_buf("\r\n>> ", 5);
             current_command_length = 0;
+        }
+    }
+}
+
+void lcd_task() {
+
+    SPI_Pins spi;
+    spi.CS      = SPI_CS_PIN;
+    spi.SCLK    = SPI_SCLK_PIN;
+    spi.MISO    = SPI_MISO_PIN;
+    spi.MOSI    = SPI_MOSI_PIN;
+    spi.DC      = SPI_DC_PIN;
+    spi.RST     = SPI_RST_PIN;
+
+    // Set column range.
+    lcd_write_cmd(&spi, 0x2A);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x00);
+    lcd_write_byte(239U >> 8U);
+    lcd_write_byte(239U & 0xFFU);
+    // Set row range.
+    lcd_write_cmd(&spi, 0x2B);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x00);
+    lcd_write_byte(319U >> 8U);
+    lcd_write_byte(319U & 0xFFU);
+    // Set 'write to RAM'
+    lcd_write_cmd(&spi, 0x2C);
+    while (1) {
+        if (lcd_color_num == 0) {
+            lcd_write_word(0xF000);
+            //lcd_write_byte(0xF0);
+            //lcd_write_byte(0x00);
+        }
+        else if (lcd_color_num == 1) {
+            lcd_write_word(0x0F00);
+            //lcd_write_byte(0x0F);
+            //lcd_write_byte(0x00);
+        }
+        else if (lcd_color_num == 2) {
+            lcd_write_word(0x00F0);
+            //lcd_write_byte(0x00);
+            //lcd_write_byte(0xF0);
+        }
+        else if (lcd_color_num == 3) {
+            lcd_write_word(0x0C0C);
+            //lcd_write_byte(0x0C);
+            //lcd_write_byte(0x0C);
         }
     }
 }
@@ -353,11 +717,14 @@ void _on_usage_fault(void) {
     uart_write_buf("*UF*", 4);
 }
 
+
 ////////////////////////////////////////////////////////////
 //  Main code
 ////////////////////////////////////////////////////////////
 
 int main(void) {
+    //  INITIALIZE CLOCK
+    clock_init();
 
     //  INITIALIZE SYSTICK
     systick_init(FREQ / 1000);
@@ -366,17 +733,28 @@ int main(void) {
     uart_init();
 
     //  INITIALIZE LED
-    STM32_Pin led_pin = {LED_PIN_BANK, LED_PIN_NUMBER};
-    led_init(led_pin);
+    //STM32_Pin led_pin = {LED_PIN_BANK, LED_PIN_NUMBER};
+    //led_init(led_pin);
 
     //  INITIALIZE BUTTON
     STM32_Pin button_pin = {BUTTON_PIN_BANK, BUTTON_PIN_NUMBER};
     button_init(button_pin);
 
+    //  INITIALIZE LCD
+    SPI_Pins spi;
+    spi.CS      = SPI_CS_PIN;
+    spi.SCLK    = SPI_SCLK_PIN;
+    spi.MISO    = SPI_MISO_PIN;
+    spi.MOSI    = SPI_MOSI_PIN;
+    spi.DC      = SPI_DC_PIN;
+    spi.RST     = SPI_RST_PIN;
+
+    lcd_init(&spi);
+
     //  INITIALIZE SCHEDULER
     add_task(&button_task, 4);
     add_task(&uart_task, 3);
-    add_task(&led_task, 2);
+    add_task(&lcd_task, 2);
     scheduler_init();
 
     for (;;) {}
