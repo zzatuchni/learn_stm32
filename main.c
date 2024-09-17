@@ -6,6 +6,7 @@
 
 #define FREQ 16000000 
 #define BIT(x) (1UL << x)
+#define BYTE_SWAP(x) ((((x) & 0xFF00) >> 8) + (((x) & 0x00FF) << 8))
 
  __attribute__((optimize("O0"))) static inline void spin(uint32_t count) {
     while (count--) asm("nop");
@@ -358,6 +359,13 @@ typedef struct {
     volatile STM32_Pin CS, SCLK, MISO, MOSI, RST, DC;
 } SPI_Pins;
 
+#define LCD_WIDTH 320U
+#define LCD_HEIGHT 240U
+
+__attribute__((used)) volatile uint16_t      lcd_color = 0x00F0;
+
+static inline void set_lcd_color(uint16_t color) { lcd_color = BYTE_SWAP(color); }
+
 static inline void spi_gpio_init(SPI_Pins *spi_pins) {
     // set up gpio pins
     
@@ -392,7 +400,6 @@ static inline void spi_gpio_init(SPI_Pins *spi_pins) {
     gpio_set_pupdr(GPIO_PP_PULL_DOWN_ONLY, spi_pins->DC);
     gpio_set_otyper(false, spi_pins->DC);
     
-
     RCC->APB2ENR |= BIT(12);
 }
 
@@ -404,6 +411,8 @@ static inline void spi_regs_init() {
     SPI1->CR1 |= BIT(0) | BIT(1) | BIT(2) | BIT(8) | BIT(9);
 
     SPI1->CR1 |= (SPI1_BAUD_CONTROL << 3);
+    SPI1->CR2 |= BIT(1); // enable DMA TX
+
     SPI1->CR1 |= BIT(6);
 }
 
@@ -578,8 +587,84 @@ static inline void lcd_init(SPI_Pins *spi) {
     spin(2000000);
     // 'Normal' display mode.
     lcd_write_cmd(spi, 0x13);
+
+    // Set column range.
+    lcd_write_cmd(spi, 0x2A);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x00);
+    lcd_write_byte((LCD_HEIGHT-1U) >> 8U);
+    lcd_write_byte((LCD_HEIGHT-1U) & 0xFFU);
+    // Set row range.
+    lcd_write_cmd(spi, 0x2B);
+    lcd_write_byte(0x00);
+    lcd_write_byte(0x00);
+    lcd_write_byte((LCD_WIDTH-1U) >> 8U);
+    lcd_write_byte((LCD_WIDTH-1U) & 0xFFU);
+    // Ready to write
+    lcd_write_cmd(spi, 0x2C);
 }
 
+////////////////////////////////////////////////////////////
+//  DMA
+////////////////////////////////////////////////////////////
+typedef struct {
+    volatile uint32_t LISR, HISR, LIFCR, HIFCR;
+} DMA_Interrupt_Regs;
+
+#define DMA_INTERRUPT_REGS_SIZE 0x10
+
+typedef struct {
+    volatile uint32_t SxCR, SxNDTR, SxPAR, SxM0AR, SxM1AR, SxFCR;
+} DMA_Stream_Regs;
+
+#define DMA_STREAM_REGS_SIZE 0x18
+
+#define DMA1_START_ADDRESS 0x40026000
+#define DMA2_START_ADDRESS 0x40026400
+
+#define DMA1_STREAM(x) (DMA_Stream_Regs *)((DMA1_START_ADDRESS) + (DMA_INTERRUPT_REGS_SIZE) + ((x) * (DMA_STREAM_REGS_SIZE)))
+#define DMA2_STREAM(x) (DMA_Stream_Regs *)((DMA2_START_ADDRESS) + (DMA_INTERRUPT_REGS_SIZE) + ((x) * (DMA_STREAM_REGS_SIZE)))
+
+static inline void dma_init() {
+    // We want channel 3 stream 3
+    DMA_Stream_Regs *DMA2 = DMA2_STREAM(3);
+
+    // Enable DMA2
+    RCC->AHB1ENR |= BIT(22); //DMA2
+
+    // Set channel
+    DMA2->SxCR |= (0x3U << 25);
+
+    // Priority high
+    DMA2->SxCR |= (0x2U << 16);
+
+    // Circular mode
+    DMA2->SxCR |= BIT(8);
+
+    // Memory size = 16 bits
+    //DMA2->SxCR |= (0x1U << 13);
+    //DMA2->SxCR |= (0x1U << 11);
+
+    // Transfer 2 items
+    //DMA2->SxNDTR |= (LCD_WIDTH * LCD_HEIGHT);
+    DMA2->SxNDTR |= 0x2U;
+
+    // Mem pointer increment
+    DMA2->SxCR |= BIT(10);
+
+    // Set direction memory-to-peripheral
+    DMA2->SxCR |= (0x1U << 6);
+
+    // Set source address
+    DMA2->SxM0AR = (uint32_t)(&lcd_color);
+
+    // Set destination address
+    DMA2->SxPAR = (uint32_t)(&(SPI1->DR));
+}
+
+static inline void dma_start() {
+    (DMA2_STREAM(3))->SxCR |= BIT(0);
+}
 
 ////////////////////////////////////////////////////////////
 //  Tasks
@@ -605,6 +690,18 @@ void button_task() {
     for(;;) {
         set_current_task_state(TASK_BLOCKED);
         lcd_color_num = (uint8_t)(lcd_color_num + 1) % 4;
+        if (lcd_color_num == 0) {
+            set_lcd_color(0xF000);
+        }
+        else if (lcd_color_num == 1) {
+            set_lcd_color(0x0F00);
+        }
+        else if (lcd_color_num == 2) {
+            set_lcd_color(0x00F0);
+        }
+        else if (lcd_color_num == 3) {
+            set_lcd_color(0x0C0C);
+        }
     }
 }
 
@@ -636,53 +733,27 @@ void uart_task() {
     }
 }
 
+
 void lcd_task() {
-
-    SPI_Pins spi;
-    spi.CS      = SPI_CS_PIN;
-    spi.SCLK    = SPI_SCLK_PIN;
-    spi.MISO    = SPI_MISO_PIN;
-    spi.MOSI    = SPI_MOSI_PIN;
-    spi.DC      = SPI_DC_PIN;
-    spi.RST     = SPI_RST_PIN;
-
-    // Set column range.
-    lcd_write_cmd(&spi, 0x2A);
-    lcd_write_byte(0x00);
-    lcd_write_byte(0x00);
-    lcd_write_byte(239U >> 8U);
-    lcd_write_byte(239U & 0xFFU);
-    // Set row range.
-    lcd_write_cmd(&spi, 0x2B);
-    lcd_write_byte(0x00);
-    lcd_write_byte(0x00);
-    lcd_write_byte(319U >> 8U);
-    lcd_write_byte(319U & 0xFFU);
-    // Set 'write to RAM'
-    lcd_write_cmd(&spi, 0x2C);
     while (1) {
         if (lcd_color_num == 0) {
             lcd_write_word(0xF000);
-            //lcd_write_byte(0xF0);
-            //lcd_write_byte(0x00);
+        
         }
         else if (lcd_color_num == 1) {
             lcd_write_word(0x0F00);
-            //lcd_write_byte(0x0F);
-            //lcd_write_byte(0x00);
+        
         }
         else if (lcd_color_num == 2) {
             lcd_write_word(0x00F0);
-            //lcd_write_byte(0x00);
-            //lcd_write_byte(0xF0);
+        
         }
         else if (lcd_color_num == 3) {
             lcd_write_word(0x0C0C);
-            //lcd_write_byte(0x0C);
-            //lcd_write_byte(0x0C);
         }
     }
 }
+
 
 ////////////////////////////////////////////////////////////
 //  Interrupts
@@ -740,6 +811,9 @@ int main(void) {
     STM32_Pin button_pin = {BUTTON_PIN_BANK, BUTTON_PIN_NUMBER};
     button_init(button_pin);
 
+    //  INITIALIZE DMA
+    dma_init();
+
     //  INITIALIZE LCD
     SPI_Pins spi;
     spi.CS      = SPI_CS_PIN;
@@ -751,10 +825,14 @@ int main(void) {
 
     lcd_init(&spi);
 
+    // START DMA STREAM
+    dma_start();
+
     //  INITIALIZE SCHEDULER
     add_task(&button_task, 4);
     add_task(&uart_task, 3);
-    add_task(&lcd_task, 2);
+    //add_task(&lcd_task, 2);
+
     scheduler_init();
 
     for (;;) {}
