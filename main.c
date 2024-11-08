@@ -12,6 +12,32 @@
     while (count--) asm("nop");
 }
 
+static inline void int_to_str(uint32_t x, char *buf, uint8_t sz, uint8_t rad) {
+    for (uint8_t i = sz; i > 0; i--) {
+        uint32_t rem = x % rad;
+        x /= rad;
+        if (rem < 10) {
+            buf[i-1] = '0' + rem;
+        }
+        else {
+            buf[i-1] = 'a' + (rem - 10);
+        }
+    }
+}
+
+static inline bool strcmp(char *buf1, char *buf2, uint8_t sz) {
+    for (uint8_t i = 0; i < sz; i++) {
+        if (buf1[i] != buf2[i]) return false;
+    }
+    return true;
+}
+
+static inline void strcopy(char *buf1, char *buf2, uint8_t sz) {
+    for (uint8_t i = 0; i < sz; i++) {
+        buf2[i] = buf1[i];
+    }
+}
+
 ////////////////////////////////////////////////////////////
 //  Pin
 ////////////////////////////////////////////////////////////
@@ -128,7 +154,6 @@ static inline void clock_init() {
     // Configure the PLL to (HSI) * 3 = 48MHz.
     // Use a PLLMUL of 0xA for *12, and keep PLLSRC at 0
     // to use (HSI / PREDIV) as the core source. HSI = 8MHz.
-   
     RCC->PLLCFGR  &= ~(uint32_t)(0x111111111111111U);
     RCC->PLLCFGR  &=  ~BIT(22);
     RCC->PLLCFGR  |=  (0x3U << 6U);
@@ -142,7 +167,6 @@ static inline void clock_init() {
     RCC->CFGR  |=  (0x00000002U);
     spin(2000000);
     
-
     while (!(RCC->CFGR & (BIT(3)))) {};
 }
 
@@ -312,12 +336,23 @@ static inline void uart_write_buf(char *buf, size_t len) {
     while (len-- > 0) uart_write_byte(*(uint8_t *) buf++);
 }
 
+void write_value(uint32_t val) {
+    for (uint8_t i = 0; i < 32; i++) {
+        uint32_t b = val & BIT(0);
+        if (b) uart_write_byte('1'); else uart_write_byte('0');
+        val = val >> 0x1U;
+    }
+    uart_write_byte('\r');
+    uart_write_byte('\n');
+}
+
 ////////////////////////////////////////////////////////////
 //  Command processing
 ////////////////////////////////////////////////////////////
 
 #define COMMAND_MAX_LENGTH 64
 __attribute__((used)) static volatile uint8_t command_buffer[COMMAND_MAX_LENGTH];
+__attribute__((used)) static volatile uint8_t prev_command_buffer[COMMAND_MAX_LENGTH];
 __attribute__((used)) static volatile uint8_t current_command_length = 0;
 //__attribute__((used)) static volatile bool command_finished = false;
 
@@ -625,53 +660,276 @@ typedef struct {
 #define DMA1_STREAM(x) (DMA_Stream_Regs *)((DMA1_START_ADDRESS) + (DMA_INTERRUPT_REGS_SIZE) + ((x) * (DMA_STREAM_REGS_SIZE)))
 #define DMA2_STREAM(x) (DMA_Stream_Regs *)((DMA2_START_ADDRESS) + (DMA_INTERRUPT_REGS_SIZE) + ((x) * (DMA_STREAM_REGS_SIZE)))
 
-static inline void dma_init() {
+typedef enum { 
+    DMA_PFRL_TO_MEM, DMA_MEM_TO_PFRL, DMA_MEM_TO_MEM 
+} DMA_Direction;
+
+static inline void dma_init(uint8_t channel, uint8_t stream, DMA_Direction direction, void *src, void *dest, uint8_t mem_width, uint32_t num_transfers) {
     // We want channel 3 stream 3
-    DMA_Stream_Regs *DMA2 = DMA2_STREAM(3);
+    DMA_Stream_Regs *DMA = DMA2_STREAM(stream);
 
     // Enable DMA2
     RCC->AHB1ENR |= BIT(22); //DMA2
 
     // Set channel
-    DMA2->SxCR |= (0x3U << 25);
+    DMA->SxCR |= (channel << 25);
 
     // Priority high
-    DMA2->SxCR |= (0x2U << 16);
+    DMA->SxCR |= (0x2U << 16);
 
     // Circular mode
-    DMA2->SxCR |= BIT(8);
+    DMA->SxCR |= BIT(8);
 
-    // Memory size = 16 bits
-    //DMA2->SxCR |= (0x1U << 13);
-    //DMA2->SxCR |= (0x1U << 11);
+    // Memory size
+    DMA->SxCR |= ((mem_width-1U) << 13);
+    DMA->SxCR |= ((mem_width-1U) << 11);
 
-    // Transfer 2 items
-    //DMA2->SxNDTR |= (LCD_WIDTH * LCD_HEIGHT);
-    DMA2->SxNDTR |= 0x2U;
+    // Transfer x items
+    DMA->SxNDTR |= num_transfers;
 
     // Mem pointer increment
-    DMA2->SxCR |= BIT(10);
+    DMA->SxCR |= BIT(10);
 
-    // Set direction memory-to-peripheral
-    DMA2->SxCR |= (0x1U << 6);
+    // Set direction 
+    DMA->SxCR |= (direction << 6);
 
-    // Set source address
-    DMA2->SxM0AR = (uint32_t)(&lcd_color);
-
-    // Set destination address
-    DMA2->SxPAR = (uint32_t)(&(SPI1->DR));
+    // Set source and address
+    if (direction == DMA_PFRL_TO_MEM) {
+        DMA->SxM0AR = (uint32_t)(dest);
+        DMA->SxPAR = (uint32_t)(src);
+    }
+    else if (direction == DMA_MEM_TO_PFRL) {
+        DMA->SxM0AR = (uint32_t)(src);
+        DMA->SxPAR = (uint32_t)(dest);
+    }
+    else if (direction == DMA_MEM_TO_MEM) {
+        DMA->SxM0AR = (uint32_t)(dest);
+        DMA->SxPAR = (uint32_t)(src);
+    }
 }
 
-static inline void dma_start() {
-    (DMA2_STREAM(3))->SxCR |= BIT(0);
+static inline void dma_start(uint8_t stream) {
+    (DMA2_STREAM(stream))->SxCR |= BIT(0);
+}
+
+////////////////////////////////////////////////////////////
+//  ADC
+////////////////////////////////////////////////////////////
+
+#define ADC_START_ADDRESS 0x40012000
+#define ADC_REGS_SIZE 0x100
+
+#define ADC_IN0_PIN    (STM32_Pin){'A', 0}
+#define ADC_IN1_PIN    (STM32_Pin){'A', 1}
+#define ADC_IN4_PIN    (STM32_Pin){'A', 4}
+
+typedef struct {
+    volatile uint32_t SR, CR1, CR2, SMPR1, SMPR2, JOFR[4], HTR, LTR, 
+        SQR1, SQR2, SQR3, JSQR, JDR[4], DR, CSR, CCR, CDR;
+} ADC_Regs;
+
+#define ADC(x) (ADC_Regs *)((ADC_START_ADDRESS) + ((x) * (ADC_REGS_SIZE)))
+
+static inline void adc_init() {
+    // Get ADC1
+    ADC_Regs *ADC1 = ADC(0);
+
+    // Enable ADC1
+    RCC->APB2ENR |= BIT(8); //ADC1
+
+    // GPIO
+    gpio_set_mode(GPIO_MODE_ANALOG, ADC_IN0_PIN);
+    gpio_set_mode(GPIO_MODE_ANALOG, ADC_IN1_PIN);
+    gpio_set_mode(GPIO_MODE_ANALOG, ADC_IN4_PIN);
+
+    gpio_set_otyper(false, ADC_IN0_PIN);
+    gpio_set_otyper(false, ADC_IN1_PIN);
+    gpio_set_otyper(false, ADC_IN4_PIN);
+
+    gpio_set_speed(GPIO_SPEED_LOW, ADC_IN0_PIN);
+    gpio_set_speed(GPIO_SPEED_LOW, ADC_IN1_PIN);
+    gpio_set_speed(GPIO_SPEED_LOW, ADC_IN4_PIN);
+
+    ADC1->CCR |= (2<<16); // clock prescaler
+
+    // configure sequence
+    ADC1->SQR1 |= (0x2U << 20U); // 3 channels, L = 2
+
+    // 1st conversion must be channel 0
+    ADC1->SQR3 |= (0x0U << 0x0);
+
+    // 2nd conversion must be channel 1
+    ADC1->SQR3 |= (0x1U << 5U);
+
+    // 3rd conversion must be channel 4
+    ADC1->SQR3 |= (0x4U << 10U);
+
+    // sample rate
+    ADC1->SMPR2 |= (0x7U);
+    ADC1->SMPR2 |= (0x7U << 0x3U);
+    ADC1->SMPR2 |= (0x7U << 0x9U);
+
+    ADC1->CR1 |= BIT(8); //SCAN
+
+    ADC1->CR2 |= BIT(10); //EOSC
+    ADC1->CR2 |= BIT(8); //DMA
+    ADC1->CR2 |= BIT(9); //DDS
+    ADC1->CR2 |= BIT(1); //CONT
+
+}
+
+static inline void adc_start() {
+    // Get ADC1
+    ADC_Regs *ADC1 = ADC(0);
+
+    ADC1->CR2 |= BIT(0); //ADON
+
+    spin(2000000);
+
+    ADC1->CR2 |= BIT(30); //SWSTART
+}
+
+static inline uint16_t adc_get_measurement() {    
+    // Get ADC1
+    ADC_Regs *ADC1 = ADC(0);
+    // clear status
+
+    ADC1->SR &= ~(0xFFFFFFFF<<0);
+
+    // Start the ADC conversion.
+    ADC1->CR2  |=   BIT(30); //SWSTART
+
+    // Wait for the 'End Of Conversion' flag.
+    while ( !( ADC1->SR & BIT(1) ) ) {}; //EOC
+    //spin(2000000);
+
+    // Read the converted value (this also clears the EOC flag).
+    uint16_t adc_val = (uint16_t)(ADC1->DR);
+
+
+    return adc_val;
+}
+
+////////////////////////////////////////////////////////////
+//  PWR
+////////////////////////////////////////////////////////////
+
+#define PWR_START_ADDRESS 0x40007000
+typedef struct {
+    volatile uint32_t CR, CSR;
+} PWR_Regs;
+
+#define PWR ((PWR_Regs *)(PWR_START_ADDRESS))
+
+////////////////////////////////////////////////////////////
+//  RTC
+////////////////////////////////////////////////////////////
+
+#define RTC_START_ADDRESS 0x40002800
+typedef struct {
+    volatile uint32_t TR, DR, CR, ISR, PRER, WUTR, CALIBR, ALRMAR, ALRMBR, WPR, SSR, SHIFTR,
+        TSTR, TSDR, TSSSR, CALR, TAFCR, ALRMASSR, ALRMBSSR, BKPxR[19];
+} RTC_Regs;
+
+#define RTC ((RTC_Regs *)(RTC_START_ADDRESS))
+
+void rtc_init() {
+
+    RCC->APB1ENR |= BIT(28); //PWREN
+
+    PWR->CR |= BIT(8); //DBP
+
+    // Configure LSE / RTC
+    RCC->BDCR |= BIT(8); //RTCSEL = 0x1 =  LSE
+
+    RCC->BDCR |= BIT(0); //LSEON
+
+    //write_value(RCC->BDCR);
+
+    while (!(RCC->BDCR & BIT(1))) {};
+
+    RCC->BDCR |= BIT(15); //RTCEN
+
+}
+
+
+
+////////////////////////////////////////////////////////////
+//  Task helpers
+////////////////////////////////////////////////////////////
+
+
+__attribute__((used)) volatile uint16_t    adc_value[3];
+void draw_joystick() {
+    uint16_t x = adc_value[0] >> 8;
+    uint16_t y = adc_value[1] >> 8;
+    uint16_t z = adc_value[2] >> 8;
+
+    char buf[16];
+
+    uart_write_buf("X: ", 3);
+    int_to_str(adc_value[0], &buf, 16, 16);
+    uart_write_buf(&buf, 16);
+    uart_write_buf("\r\n", 2);
+
+    uart_write_buf("Y: ", 3);
+    int_to_str(adc_value[1], &buf, 16, 16);
+    uart_write_buf(&buf, 16);
+    uart_write_buf("\r\n", 2);
+
+    uart_write_buf("Z: ", 3);
+    int_to_str(adc_value[2], &buf, 16, 16);
+    uart_write_buf(&buf, 16);
+    uart_write_buf("\r\n", 2);
+
+    for (int i = 0; i < 16; i++) {
+        for (int j = 0; j < 16; j++) {
+            if (x == i && y == j) {
+                if (z > 6) uart_write_byte('X'); else uart_write_byte('O');
+            }
+            else uart_write_byte('.');
+        }
+        uart_write_byte('\r');
+        uart_write_byte('\n');
+    }
+}
+
+void print_time() {
+    uart_write_buf("TR\r\n", 4);
+    write_value(RTC->TR);
+    uart_write_buf("DR\r\n", 4);
+    write_value(RTC->DR);
+    uart_write_buf("SSR\r\n", 5);
+    write_value(RTC->SSR);
+}
+
+void handle_command(char *command, uint8_t length) {
+    if (strcmp(command, "time", 4)) {
+        print_time();
+    }
+    else if (strcmp(command, "jstk", 4)) {
+        draw_joystick();
+    }
+    else {
+        uart_write_buf("Not a command", 13);
+    }
 }
 
 ////////////////////////////////////////////////////////////
 //  Tasks
 ////////////////////////////////////////////////////////////
 
-void handle_command(char *command, uint8_t length) {
-    uart_write_buf(command, length);
+void rtc_task() {
+    for (;;) {
+        uart_write_buf("\33c", 2);
+        uart_write_buf("TR\r\n", 4);
+        write_value(RTC->TR);
+        uart_write_buf("DR\r\n", 4);
+        write_value(RTC->DR);
+        uart_write_buf("SSR\r\n", 5);
+        write_value(RTC->SSR);
+        delay_current_task(2000); 
+    }
 }
 
 __attribute__((used)) volatile bool         led_on = false;
@@ -682,6 +940,14 @@ void led_task() {
         led_on = !led_on;
         delay_current_task(1000);
         
+    }
+}
+
+void adc_task() {
+    for (;;) {
+        uart_write_buf("\33c", 2);
+        draw_joystick();
+        delay_current_task(1000);
     }
 }
 
@@ -707,6 +973,7 @@ void button_task() {
 
 __attribute__((used)) volatile uint8_t      uart_byte = 0x00;
 void uart_task() {
+    uart_write_buf("\33c>> ", 5);
     for (;;) {
         set_current_task_state(TASK_BLOCKED);
         uint8_t byte = uart_byte;
@@ -811,8 +1078,8 @@ int main(void) {
     STM32_Pin button_pin = {BUTTON_PIN_BANK, BUTTON_PIN_NUMBER};
     button_init(button_pin);
 
-    //  INITIALIZE DMA
-    dma_init();
+    //  INITIALIZE DMA for LCD
+    dma_init(3, 3, DMA_MEM_TO_PFRL, (void *)&lcd_color, (void *)&(SPI1->DR), 1, 2);
 
     //  INITIALIZE LCD
     SPI_Pins spi;
@@ -825,12 +1092,29 @@ int main(void) {
 
     lcd_init(&spi);
 
-    // START DMA STREAM
-    dma_start();
+    // START DMA for LCD
+    dma_start(3);
+
+    // INITIALIZE ADC
+    adc_init();
+
+    //  INITIALIZE DMA for ADC
+    dma_init(0, 0, DMA_PFRL_TO_MEM, (void *)&((ADC(0))->DR), (void *)&adc_value, 2, 3);
+
+    //  START DMA for ADC
+    dma_start(0);
+
+    //  START ADC
+    adc_start();
+
+    //  INITIALIZE RTC
+    rtc_init();
 
     //  INITIALIZE SCHEDULER
     add_task(&button_task, 4);
     add_task(&uart_task, 3);
+    //add_task(&rtc_task, 5);
+    //add_task(&adc_task, 5);
     //add_task(&lcd_task, 2);
 
     scheduler_init();
